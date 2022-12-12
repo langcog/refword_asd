@@ -1,0 +1,150 @@
+---
+title: "Refword ASD analyses"
+author: "Mike Frank & Dan Yurovsky"
+date: "Sept 16, 2015"
+output: html_document
+---
+
+## Preliminaries
+
+```{r}
+library(readr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(langcog)
+theme_set(theme_mikabr())
+```
+
+Read data.
+
+```{r}
+d <- read_csv("processed_data/summary/wide_form_asd.csv")
+```
+
+Reformat. 
+
+```{r}
+d %<>% 
+  gather(variable, value, starts_with("reflook"), 
+         starts_with("kitchen"), starts_with("birthday")) %>%
+  separate(variable, c("stim","dv"), sep = "_") %>%
+  mutate(time = ifelse(stim == "reflook", 0, 
+                       ifelse(stim == "kitchen", 12, 24)))
+```
+
+## By subject analyses
+
+```{r}
+qplot(time, value, group = subj,
+      col = group,
+      geom = "line", 
+      facets = . ~ dv, 
+      data = d)
+```
+
+## Group analyses
+
+First do groupings. 
+
+```{r}
+ms <- d %>%
+  group_by(group, dv, time) %>%
+  summarise(sem = sem(value, na.rm=TRUE),
+            sd = sd(value, na.rm=TRUE),
+            value = mean(value, na.rm=TRUE),
+            n = n()) %>%
+  ungroup() %>%
+  mutate(group = factor(group, levels = c("control","tx"), 
+                        labels = c("Control","Treatment")))
+
+ms.ci <- d %>%
+  group_by(group, dv, time) %>%
+  multi_boot_standard(column = "value", na.rm = TRUE)
+
+```
+
+Effect sizes
+
+```{r}
+ms %>% select(-sem) %>% spread(group, value)
+
+```
+
+All DVs.
+
+```{r}
+qplot(time, value, ymin = value - sem, ymax = value + sem,
+      col = group, group = group,
+      position = position_dodge(width = .5), 
+      geom = c("line", "pointrange"), 
+      facets = ~ dv, 
+      data = ms)
+```
+
+With CIs.
+
+```{r}
+qplot(time, mean, ymin = ci_lower, ymax = ci_upper,
+      col = group, group = group,
+      position = position_dodge(width = .5), 
+      geom = c("line", "pointrange"), 
+      facets = ~ dv, 
+      data = ms.ci)
+```
+
+Just faces.
+
+```{r}
+qplot(time, value, ymin = value - sem, ymax = value + sem,
+      col = group, group = group,
+      position = position_dodge(width = .5), 
+      geom = c("line", "pointrange"), 
+      data = filter(ms, dv %in% c("Face"))) + 
+  ylim(c(0, .3)) + 
+  xlab("Time (weeks)") +
+  ylab("Proportion looking at faces")
+```
+
+Just novel word learning.
+
+```{r}
+qplot(time, value, ymin = value - sem, ymax = value + sem,
+      col = group, group = group,
+      position = position_dodge(width = .5), 
+      geom = c("line", "pointrange"), 
+      data = filter(ms, dv %in% c("Novel"))) + 
+  ylim(c(.2, .9)) + 
+  geom_hline(yintercept = .5, lty = 2, col = "black") + 
+  xlab("Time (weeks)") +
+  ylab("Proportion looking at novel word")
+```
+
+## Measure reliability
+
+Reshape data.
+
+```{r}
+subs <- d %>% select(-stim) %>% spread(time, value)
+```
+
+Now make a correlaton plot. 
+
+```{r}
+face <- filter(subs, dv == "Face") %>%
+            select(-group, -dv, -subj) %>%
+  data.frame
+
+ggcorplot(face %>% filter(complete.cases(face))) 
+```
+
+And novel word learning. 
+
+```{r}
+novel <- filter(subs, dv == "Novel") %>%
+            select(-group, -dv, -subj) %>%
+  data.frame
+
+ggcorplot(novel %>% filter(complete.cases(novel))) 
+```

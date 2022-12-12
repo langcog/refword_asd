@@ -1,0 +1,598 @@
+---
+title: "Refword ASD analyses"
+author: "Mike Frank & Dan Yurovsky"
+date: "Sept 16, 2015"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(purrr)
+
+# #load libraries for data manipulation and graphing
+library(xtable)
+library(data.table)
+library(jpeg)
+library(XML)
+library(magrittr)
+library(zoo)
+library(langcog)
+
+```
+
+# Constants
+
+```{r}
+#try/catch for different number of calib points
+MAX_HEADER_ROWS <- 40
+
+video = 1
+
+VIDEOS = c("reflook", "birthday", "kitchen") #, "soc_word")
+
+LEARN_STIMS = list("reflook4_4.avi", "ref-asd-birthday2.avi", 
+                "ref-asd-kitchen2.avi") #, SOCWORD_LEARN_STIMS)
+
+CALIB_STIMS = c("reflook4_4.avi", "ref-asd-birthday2.avi",
+                "ref-asd-kitchen2.avi","calib.avi")
+CALIB_STIM_LENGTHS <- c(NA,NA,NA,11.344)
+CALIB_STIM_LENGTH <- CALIB_STIM_LENGTHS[video]
+
+
+EXCLUDED_STIMS <- read.csv(paste0("metadata/loading_files/",
+                                  VIDEOS[video],"_excluded.csv"),header = FALSE)$V1
+
+LEARN_STIM <- LEARN_STIMS[video]
+CALIB_STIM <- CALIB_STIMS[video]
+
+X_MAX <- 1680
+Y_MAX <- 1050
+
+CALIB_SACCADE_time <- .3
+
+FRAME_RATE <- 30
+
+IMG_WIDTHS = c(1280,1920,1920,720) #960
+IMG_HEIGHTS = c(720,1080,1080,720) #540
+
+IMG_WIDTH = IMG_WIDTHS[video]
+IMG_HEIGHT= IMG_HEIGHTS[video]
+
+SCALE_X = X_MAX/IMG_WIDTH
+SCALE_Y = Y_MAX/IMG_HEIGHT
+
+LEARN_STIM_LENGTHS = c(256.823, 293.493, 307.373, NA)
+
+LEARN_STIM_LENGTH <- LEARN_STIM_LENGTHS[video]
+
+TEST_LENGTHS <- c(6, 6, 6, 7.5)
+TEST_LENGTH <- TEST_LENGTHS[video]
+
+AOI_BUFFER <- 25
+
+GROUP <- "child"
+ET_DATA_DIR <- "raw_data/"
+# ET_DATA_DIR <- "ground_truth_test/"
+# ET_DATA_DIR <- "raw_data_pilots/"
+```
+
+# Read all raw data 
+
+```{r}
+source('loading_helpers/et_helper.R')
+files <- list.files(path = ET_DATA_DIR, pattern = '*.txt',
+                    all.files = FALSE)
+
+info <- map_df(paste0(ET_DATA_DIR, files), get_smi_header)
+
+raw_data <- info %>%
+  mutate(n = 1:n()) %>%
+  split(.$n) %>%
+  map_df(read_smi_idf)
+```
+
+Here's an observation. The tracker says the screen is 1680x1050 across all files. Yet the 
+max x position in the raw data is 1280. 
+
+Original image files are 1209 x 756
+```{r}
+hist(raw_data$lx)
+hist(raw_data$ly)
+
+max(raw_data$rx)
+max(raw_data$ry)
+```
+
+Let's try looking at this by subject.
+```{r}
+p <- ggplot(raw_data, aes(x = lx, y = ly)) + 
+  geom_point(alpha = .05) + 
+  facet_wrap(~file_name)
+
+p
+```
+
+
+
+```{r}
+length(files)
+
+tibble(name = str_replace(files,"PRPT_","") %>%
+  str_replace("-eye_data Samples.txt","")) %>%
+  separate(name, into = c("id","wks"), sep = "_") %>%
+  pull(id) %>% unique() %>% length()
+```
+
+
+Undo stimulus hashing.
+
+```{r}
+hashes <- read_csv("stimuli_hashes/uniquehashes.csv") %>%
+  rename(true_stimulus = X1, 
+         hash = X2) %>%
+  mutate(hash = str_replace(hash,"\">\n",""))
+
+hashed_data <- raw_data %>%
+  mutate(original_label = stimulus) %>%
+  rename(hash = stimulus) %>%
+  mutate(has_hash = str_length(original_label) > 30) %>%
+  left_join(hashes) %>%
+  mutate(true_stimulus = ifelse(has_hash, true_stimulus, original_label),
+         true_stimulus = str_to_lower(true_stimulus))
+```
+
+
+The hash table was provided by Jared Gong to undo the terribleness of SMI stimuli getting mapped to different hashes for different subjects. Unfortunately, we don't have the stimulus log for several files. 
+
+```{r}
+filtered_data <- hashed_data %>%
+  rename(stimulus = true_stimulus) %>%
+  select(-hash, -has_hash, -original_label) %>%
+  filter(str_detect(stimulus, "avi|jpg"), 
+         str_length(stimulus) < 30, 
+         !is.na(stimulus), 
+         !str_detect(stimulus, "simpkids"))
+```
+
+Preprocess: average eyes, flip coords, etc.
+
+```{r}
+all_results <- preprocess_data(filtered_data) %>%
+  mutate(subid = str_replace(str_replace(file_name, "raw_data/PRPT_", ""), 
+                             "-eye_data Samples.txt","")) %>%
+  mutate(x = ifelse(x == 0 | x >= width | y == 0 | y >= height, NA, x),
+         y = ifelse(x == 0 | x >= width | y == 0 | y >= height, NA, y)) %>%
+  mutate(x = ifelse(is.na(x), NA, x), 
+         y = ifelse(is.na(y), NA, y)) %>% # get rid of NaN
+  select(t, stimulus, subid, x, y) 
+```
+
+Let's just look at the xs and ys. 
+
+```{r}
+hist(all_results$x)
+hist(all_results$y)
+```
+
+
+```{r}
+hist(all_results$x[all_results$stimulus == "ref-asd-birthday2.avi"])
+hist(all_results$y[all_results$stimulus == "ref-asd-birthday2.avi"])
+```
+
+```{r}
+hist(all_results$x[all_results$stimulus == "r_bird_shoe.jpg"])
+hist(all_results$y[all_results$stimulus == "r_bird_shoe.jpg"])
+```
+
+Sanity check. 
+
+```{r}
+filter(all_results, stimulus == "ref-asd-birthday2.avi") %>%
+  ggplot(aes(x = x, y = y)) + 
+  geom_point(alpha = .01) + 
+  xlim(0,1680) + 
+  ylim(0,1050)
+```
+
+```{r}
+filter(all_results, stimulus == "ref-asd-birthday2.avi") %>%
+  ggplot(aes(x = x, y = y)) + 
+  geom_point(alpha = .01) + 
+  xlim(0,1680) + 
+  ylim(0,1050)
+```
+
+Something is horrible about the `t` values coming out of these files. 
+
+Let's start by adjusting them so they all start within zero. Let's also make sure they are all measured in milliseconds.
+
+```{r}
+all_results %<>% 
+  group_by(subid) %>% 
+  mutate(t = (t - min(t))*1000) 
+
+hist(all_results$t) 
+```
+
+There was some extra blank screen stuff shown to some kids at the end:
+
+```{r}
+qplot(filter(all_results, subid == "4013_24wk")$t, fill = filter(all_results, subid == "4013_24wk")$stimulus)
+```
+
+We can go back and do calibration adjustment if we want.
+
+<!-- Calibration adjustment -->
+
+```{r}
+# source('loading_helpers/adjust_calibs.R')
+# adjusted_data <- adjust_calibs(plot = FALSE, video = VIDEOS[video])
+# adjusted_data <- all_results
+```
+
+```{r}
+conditions <- all_results %>%
+  filter(stimulus %in% LEARN_STIMS) %>%
+  group_by(subid) %>%
+  summarise(condition = stimulus[1]) %>%
+  mutate(condition = case_when(condition == "reflook4_4.avi" ~ "reflook",
+                               condition == "ref-asd-birthday2.avi" ~ "birthday",
+                               condition == "ref-asd-kitchen2.avi" ~ "kitchen"))
+
+all_results <- left_join(all_results, conditions)
+```
+
+
+# Test stimuli
+
+
+Read in annotations.
+
+```{r}
+test_annotations <- lapply(VIDEOS, function (x) {
+  read_csv(paste0("metadata/aois/", x, "_tests.csv")) %>%
+    mutate(condition = x)
+  }) %>%
+  map_df(bind_rows) %>%
+  mutate(stimulus = tolower(Stimulus),
+         onset = onset * 1000) %>%
+  select(-Stimulus) 
+```
+
+Now merge these in with the results.
+
+```{r}
+test_data <- all_results %>%
+  filter(str_detect(stimulus, ".jpg" )) %>%
+  filter(!(stimulus %in% EXCLUDED_STIMS)) %>%
+  group_by(subid, stimulus) %>%
+  mutate(t = t - min(t), 
+         instance = ifelse(t > TEST_LENGTH*1000 + 200, 2, 1)) %>%
+  group_by(subid, stimulus, instance) %>% # have to redo this to deal with repeating stimuli
+  mutate(t = t - min(t)) %>%
+  left_join(test_annotations) %>%
+  filter(stimulus %in% test_annotations$stimulus) 
+```
+
+
+
+
+Read in test AOIs.
+
+```{r}
+source("loading_helpers/load_aois.R")
+test_aois <- get_test_aois() %>%
+  select(-Time) %>%
+  rename(target = aoi_name) %>%
+  group_by(target) %>%
+  distinct() %>%
+  mutate(top_left_x = top_left_x,
+         bottom_right_x = bottom_right_x) #* 1209/1680
+```
+
+Merge and process aois. 
+
+We need t to be more regular. Let's do something basic where we just round it to the nearest 50ms. 
+
+```{r}
+test_all_aoi_data <- left_join(test_data, test_aois) %>%
+  mutate(in_aoi = (x >= top_left_x - AOI_BUFFER) & 
+           (x <= bottom_right_x + AOI_BUFFER) &
+           (y >= top_left_y - AOI_BUFFER) &
+           (y <= bottom_right_y + AOI_BUFFER)) %>%
+  group_by(stimulus, instance) %>%
+  group_by(subid, stimulus, instance) %>%
+  mutate(t = round(t / 50) * 50, 
+         onset = round(onset / 50) * 50) %>%
+  mutate(t_onset = t - onset) 
+```
+
+Let's do some checks on the quality of the ET data. 
+```{r}
+ggplot(test_all_aoi_data, aes(x = x)) + 
+  geom_histogram() +
+  facet_wrap(~stimulus)
+```
+
+```{r}
+ggplot(test_all_aoi_data, aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_rect(aes(xmin = top_left_x, 
+                xmax = bottom_right_x, 
+                ymin = top_left_y, 
+                ymax = bottom_right_y), fill = NA, col = "black", lty = 2) + 
+  facet_wrap(~stimulus) 
+```
+
+
+```{r}
+test_means <- test_all_aoi_data %>%
+  group_by(t_onset, stimulus, instance, type) %>%
+  summarise(correct = mean(in_aoi, na.rm=TRUE)) 
+```
+
+
+```{r}
+ggplot(filter(test_means, stimulus == "l_balloon_sock.jpg"), 
+       aes(x = t_onset, y = correct)) + 
+  geom_point()
+```
+
+```{r}
+ggplot(filter(test_means, type == "Familiar"), 
+       aes(x = t_onset, y = correct)) +
+  geom_point() + 
+  geom_hline(yintercept = .5, lty = 2) +
+  geom_vline(xintercept = 0, lty = 3)
+```
+
+
+```{r}
+# 
+# test_other_data <- test_all_aoi_data %>%
+#   group_by(subid, stimulus, instance, t, type) %>%
+#   summarise(num_in = sum(in_aoi)) %>%
+#   filter(is.na(num_in) | num_in == 0) %>%
+#   ungroup() %>%
+#   rename(aoi_name = num_in) %>%
+#   mutate(aoi_name = as.factor(aoi_name))
+# 
+# test_aoi_data <- test_all_aoi_data %>%
+#   filter(in_aoi) %>%
+#   select(subid, stimulus, instance, type, t, aoi_name) %>%
+#   bind_rows(test_other_data) %>%
+#   ungroup() %>%
+#   arrange(subid, stimulus, instance, t) %>%
+#   left_join(test_annotations) %>%
+#   filter(!is.na(target)) %>%
+#   rowwise() %>%
+#   mutate(aoi = if(is.na(aoi_name)) as.character(NA)
+#          else if(aoi_name == target) "Target"
+#          else if(aoi_name == "0") "Other"
+#          else "Competitor") %>%
+#   mutate(onset = floor(FRAME_RATE * onset) / FRAME_RATE) %>%
+#   group_by(type, trial) %>%
+#   mutate(time = trunc(time - onset)) %>%
+#   rowwise() %>%
+#   mutate(time = closest(time)) 
+
+```
+
+
+```{r}
+ms <- test_aoi_data %>%
+  group_by(t) %>%
+  summarise(correct = mean(aoi == "Target", na.rm=TRUE) / 
+              mean(aoi %in% c("Target","Competitor"), na.rm=TRUE))
+
+ggplot(ms, 
+       aes(x = t, y = correct)) + 
+  geom_point()
+  
+```
+
+
+# Training
+
+```{r}
+learn_data <- all+results %>%
+  filter(stimulus %in% unlist(LEARN_STIM)) %>%
+  group_by(subid, stimulus) %>%
+  zero_times(., LEARN_STIM_LENGTH)
+
+
+train_annotations <- read_csv(paste0("metadata/aois/", 
+                                     VIDEOS[video], "_trains.csv"))
+
+
+source('loading_helpers/load_aois.R')
+train_aois <- get_train_aois(video = VIDEOS[video]) %>%
+  rowwise() %>%
+  mutate(Time = closest(Time)) %>%
+  filter(!str_detect(aoi_name, "hand")) %>%
+  rename(t = Time)
+
+  
+```
+
+
+```{r}
+
+train_all_aoi_data <- left_join(learn_data, train_aois) %>%
+  filter(!is.na(aoi_name)) %>%
+  mutate(in_aoi = (x_mean >= top_left_x - AOI_BUFFER) & 
+           (x_mean <= bottom_right_x + AOI_BUFFER) &
+           (y_mean >= top_left_y - AOI_BUFFER) &
+           (y_mean <= bottom_right_y + AOI_BUFFER)) %>%
+  ungroup()
+
+```
+
+```{r}
+
+train_other_data <- train_all_aoi_data %>%
+  summarise(num_in = sum(in_aoi)) %>%
+  filter(is.na(num_in) | num_in == 0) %>%
+  ungroup() %>%
+  rename(aoi_name = num_in) %>%
+  mutate(aoi_name = as.factor(aoi_name))
+
+train_aoi_data <- train_all_aoi_data %>%
+  filter(in_aoi) %>%
+  select(subj, instance, time, aoi_name) %>% #for reflook4 dunno
+  bind_rows(train_other_data)
+
+train_annotated_data <- bind_rows(lapply(1:nrow(train_annotations), function(x) {
+  filter(train_aoi_data, time >= as.numeric(train_annotations[x,"start"]) & 
+           time <= as.numeric(train_annotations[x,"end"])) %>%
+    cbind(train_annotations[x,])})) %>%
+  rowwise() %>%
+  mutate(aoi = if(is.na(aoi_name)) as.character(NA)
+         else if(tolower(aoi_name) == tolower(Target)) "Target"
+         else if(tolower(aoi_name) == tolower(Competitor)) "Competitor"
+         else if(tolower(aoi_name) == tolower(Face)) "Face"
+         #            else if(!is.na(Other_Face) & 
+         #                    tolower(aoi_name) == tolower(Other_Face)) "Other Face"
+         else if(tolower(aoi_name) == "0") "None"
+         else "Other") %>%
+  select(-aoi_name, -Target, -Competitor, -Face, -Hand) %>%
+  #  -Other_Face, -Hand) %>%
+  mutate(window_type = if(time >= start & 
+                          time < name1) "baseline"
+         else if(time >= name1 & 
+                 time < look) "name_look"
+         else if(time >= look &
+                 time < name2) "look_name2"
+         else if(time >= name2 &
+                 time < initiate_reach) "name2_reach"
+         else if(time >= initiate_reach &
+                 time < point_of_contact) "reach_contact"
+         else if(time >= point_of_contact &
+                 time <= end) "contact_end"
+         else "NA") %>%
+  ungroup() %>%
+  filter(window_type != "NA") %>%
+  mutate(window_type = factor(window_type, 
+                              levels = c("baseline", "name_look", "look_name2",
+                                         "name2_reach", "reach_contact",
+                                         "contact_end"))) %>%
+  select(-start, -name1, -look, -name2, -name3,
+         -initiate_reach ,-point_of_contact, -end) %>%
+  group_by(subj, trial) %>%
+  mutate(time = time - min(time)) %>%
+  rowwise() %>%
+  mutate(time = closest(time))
+```
+
+
+# Get all times in AOIS
+
+
+
+<!-- ## Add Demographic Data  -->
+
+<!-- demo_data <- fread(paste0('raw_data/demo_data/',VIDEOS[video], -->
+<!--                              "/", GROUP,'.subinfoR4.csv')) -->
+
+<!-- if(VIDEOS[video] == "soc_word"){ -->
+<!--   demo_data %<>% -->
+<!--     select(subid, age, gender, english, parent_education, premature) %>% -->
+<!--     rename(subj = subid) -->
+
+<!--   test_aoi_data %<>% left_join(demo_data) -->
+<!--   train_annotated_data %<>% left_join(demo_data)  -->
+<!-- } else if(GROUP == "child") { -->
+
+<!--   #  -->
+<!--   # tmp <- raw_child_test_data %>% -->
+<!--   #   rowwise() %>% -->
+<!--   #   mutate(english = if(is.na(english)) as.numeric(NA) -->
+<!--   #          else if(english == 6) 100 -->
+<!--   #          else if(english == 5) 90 -->
+<!--   #          else if(english == 4) 75 -->
+<!--   #          else if(english == 3) 50 -->
+<!--   #          else if(english == 2) 25 -->
+<!--   #          else if(english == 1) 5 -->
+<!--   #          else 0) -->
+<!--   #  -->
+<!--   # tmp <- tmp %>% -->
+<!--   #   rowwise() %>% -->
+<!--   #   mutate(premie = if(is.na(premie)) as.logical(NA) -->
+<!--   #          else if(premie == 1) FALSE -->
+<!--   #          else TRUE) -->
+
+<!--   demo_data %<>% -->
+<!--     select(subid, dot, dob, gender, english, premie) %>% -->
+<!--     mutate_each(funs(mdy), dot, dob) %>% -->
+<!--     mutate(age = (dot - dob)/dyears(1), -->
+<!--            gender = factor(gender, labels = c("Male", "Female",NA))) %>% -->
+<!--     rename(subj = subid) %>% -->
+<!--     select(-dot, -dob) -->
+<!--   test_aoi_data %<>% left_join(demo_data) -->
+<!--   train_annotated_data %<>% left_join(demo_data)  -->
+<!-- } else if(GROUP == "ASD") { -->
+<!--   demo_data %<>% -->
+<!--     select(subid, dot, dob, gender) %>% -->
+<!--     mutate_each(funs(mdy), dot, dob) %>% -->
+<!--     mutate(age = (dot - dob) / dyears(1), -->
+<!--            gender = factor(gender, levels = c("m", "f"), -->
+<!--                            labels = c("Male", "Female"))) %>% -->
+<!--     rename(subj = subid) %>% -->
+<!--     select(-dot, -dob) -->
+<!--   test_aoi_data %<>% left_join(demo_data) -->
+<!--   train_annotated_data %<>% left_join(demo_data)  -->
+<!-- } else if(GROUP == "long") { -->
+<!--   demo_data %<>% -->
+<!--     select(subid, dot, dob, gender) %>% -->
+<!--     mutate_each(funs(mdy), dot, dob) %>% -->
+<!--     mutate(age = (dot - dob)/dyears(1), -->
+<!--            gender = factor(gender, labels = c("Male", "Female"))) %>% -->
+<!--     rename(subj = subid) %>% -->
+<!--     select(-dot,-dob) -->
+<!--   test_aoi_data %<>% left_join(demo_data) -->
+<!--   train_annotated_data %<>% left_join(demo_data)  -->
+<!-- } -->
+<!-- ############################################################################### -->
+<!-- ############################## Write Output Data ############################## -->
+<!-- ############################################################################### -->
+<!-- write_csv(test_aoi_data, paste0('processed_data/csvs/',VIDEOS[video], "/", -->
+<!--                                GROUP,'/test_data.csv')) -->
+<!-- write_csv(train_annotated_data, paste0('processed_data/csvs/', -->
+<!--                                       VIDEOS[video], "/",  -->
+<!--                                       GROUP,'/train_data.csv')) -->
+
+<!-- tmp <- train_annotated_data %>% -->
+
+<!--   group_by(time, trial, subj) %>% -->
+<!--   summarise(correct = sum(aoi == "Target",na.rm=T)/ -->
+<!--               (sum(aoi=="Target",na.rm=T)+sum(aoi=="Competitor",na.rm=T))) %>% -->
+<!--   summarise(correct = mean(correct, na.rm = T)) %>% -->
+<!--   summarise(correct = mean(correct, na.rm = T)) -->
+
+
+
+
+<!-- # Get Trial Data -->
+
+<!-- ```{r} -->
+<!-- zero_times <- function(gaze_data, stim_length, split = FALSE) { -->
+
+<!--   gaze_data <- gaze_data %>% -->
+<!--     mutate(t = (t - min(t))/1000000) %>% -->
+<!--     mutate(instance = ifelse(split & (t > TEST_LENGTH + .2), -->
+<!--                              2, 1)) %>% #reflook4 issue -->
+<!--      group_by(instance, add = TRUE) %>% -->
+<!--      mutate(t = (t - min(t))) -->
+
+<!--   if(!is.na(stim_length)) -->
+<!--     gaze_data %<>% mutate(t = (t - (max(t) - stim_length))) -->
+
+<!--   gaze_data %>% -->
+<!--     filter(t > 0) %>% -->
+<!--     mutate(t = trunc(floor(FRAME_RATE * t) / FRAME_RATE))%>% -->
+<!--     group_by(t, add=TRUE) %>% -->
+<!--     summarise_each(funs(mean = mean(., na.rm = T)), c(x, y)) -->
+<!-- } -->
+
+<!-- ``` -->
